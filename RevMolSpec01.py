@@ -1,6 +1,3 @@
-#mine12 fully reversible, testing xyz, reversible for the latent image only
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

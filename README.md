@@ -7,8 +7,9 @@ The following programs use an iRevNet inspired by https://github.com/jhjacobsen/
 
 This projects a 4x16x16 (=1024) structure prediction onto a 1024-bit binned spectrum. It works reversible for outputs coming from a trained input. It does not work correctly for "random" inputs. The reason is that the entropy of the input is higher than the entropy of the output. Those need to match in order to work for any outputs as inputs.
 
+##RevMolSpec02.py
 
-
+This reduces the actual information in the spectrum to 128 bits (roughly the same as entropy in the structure input). The network is fully reversible and stable. Should in principle work, tested a few cases.
 
 
 
