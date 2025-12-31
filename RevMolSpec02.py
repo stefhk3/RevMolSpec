@@ -162,7 +162,7 @@ def coarsen_Y(Y, y_coarse_dim=128):
 # ============================================================
 #  loss function (this is still problematic
 # ============================================================
-def distance_aware_bce_loss(logits, targets):
+def distance_aware_bce_loss(logits, targets, logit_reg_weight=1e-3):
     """
     logits: [batch, 1024]
     targets: [batch, 1024] with multiple possible 1s
@@ -197,8 +197,14 @@ def distance_aware_bce_loss(logits, targets):
     # Elementwise BCE
     bce = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
 
-    # Weighted loss
-    return (bce * weights).mean()
+
+    weighted_bce = (bce * weights).mean()
+
+    logit_reg = (logits ** 2).mean()
+
+    probs = torch.sigmoid(logits)
+
+    return weighted_bce + logit_reg_weight * logit_reg
 
 
 # ============================================================
