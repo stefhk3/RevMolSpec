@@ -11,6 +11,7 @@ This projects a 4x16x16 (=1024) structure prediction onto a 1024-bit binned spec
 
 This reduces the actual information in the spectrum to 128 bits (roughly the same as entropy in the structure input). The network is fully reversible and stable. Should in principle work, tested a few cases.
 
+##RevMolSpec03.py
 
-
+This learns a prior an Z_free and has X-magnitude regularization. This means the network works an a half-way sensible fashion even for Y inputs it has not seen during learning.
 
