@@ -15,3 +15,6 @@ This reduces the actual information in the spectrum to 128 bits (roughly the sam
 
 This learns a prior an Z_free and has X-magnitude regularization. This means the network works an a half-way sensible fashion even for Y inputs it has not seen during learning.
 
+##RevMolSpec04.py
+
+This adds aggregate statistics and a decoder for reconstructed inputs. Largely works as expected.
