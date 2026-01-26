@@ -146,8 +146,6 @@ def validate_epoch(
     Z_free_sampled = torch.randn_like(Z_free)
     # Inverse pass
     X_gen = model.inverse(Z_free_sampled, Y_latent)
-    # X-range penalty
-    loss_x = lambda_x * x_range_penalty(X_gen)
     loss_other = loss_function_x(X_gen, X_val)
     print("Target coarse mean:", Y_target_coarse.mean().item())
     # ---- F1 ----
@@ -416,15 +414,6 @@ def train(model, X, Y, Xv, Yv, epochs=5, batch_size=32, lr=1e-3):
 
             # Inverse pass
             X_gen = model.inverse(Z_free_sampled, Y_latent)
-            # X-range penalty
-            loss_x = lambda_x * x_range_penalty(X_gen)
-            # x sparsity
-            loss_sparse = lambda_1 * X_gen.abs().mean()
-            # conditional density matching
-            X_prob = torch.sigmoid(alpha * X_gen)
-            true_density = xb.mean(dim=(1,2,3))
-            gen_density  = X_prob.mean(dim=(1,2,3))
-            loss_density = lambda_2 * ((gen_density - true_density) ** 2).mean()
             # Total loss
             x_weight = min(1.0, ep / 10)
             loss = loss_y + x_weight * loss_function_x(X_gen,xb)
@@ -433,7 +422,7 @@ def train(model, X, Y, Xv, Yv, epochs=5, batch_size=32, lr=1e-3):
             opt.step()
             losses.append(loss.item())
 
-        print("Loss train y ", loss_y," loss train other: ",(loss_x + loss_sparse + loss_density))
+        print("Loss train y ", loss_y," loss train other: ",(loss_function_x(X_gen,xb)))
         model.eval()
         metrics = validate_epoch(
             model,
@@ -504,47 +493,29 @@ def z_free_stats(model, X_val):
 
 
 @torch.no_grad()
-def conditional_variation_stats(
-    model,
-    Y_latent,   # shape: [N, y_dim]
-    Z_free,     # shape: [N, z_dim]
-    batch_size=64
-):
-    """
-    Estimates conditional variation of X given Y_latent by aggregating
-    over Z_free samples.
-
-    Returns mean and std of ||X - E[X|Y]||.
-    """
-
+def conditional_variation_stats(model, Y_latent, n_z=8):
     device = Y_latent.device
     model.eval()
 
-    Xs = []
+    per_y_vals = []
 
-    for i in range(0, Z_free.shape[0], batch_size):
-        Zb = Z_free[i:i+batch_size]
-        Yb = Y_latent[i:i+batch_size]
+    for i in range(Y_latent.shape[0]):
+        Y_fixed = Y_latent[i:i+1].expand(n_z, -1)  # [n_z, y_dim]
+        Z = torch.randn(n_z, model.z_free_dim, device=device)
 
-        Xb = model.inverse(Zb, Yb)   # shape: [B, ...]
-        Xs.append(Xb)
+        X = model.inverse(Z, Y_fixed)              # [n_z, C, H, W]
+        X_mean = X.mean(dim=0, keepdim=True)
 
-    # Stack all generated X
-    Xs = torch.cat(Xs, dim=0)        # shape: [N, ...]
-    
-    # Conditional mean E[X | Y]
-    X_mean = Xs.mean(dim=0, keepdim=True)
+        dev = (X - X_mean).flatten(start_dim=1).norm(dim=1).mean()
+        per_y_vals.append(dev)
 
-    # Deviation from conditional mean
-    # IMPORTANT: flatten per-sample before norm
-    deviations = (Xs - X_mean).flatten(start_dim=1).norm(dim=1)
+    per_y_vals = torch.stack(per_y_vals)
 
     return {
-        "cond_var_mean": deviations.mean().item(),
-        "cond_var_std": deviations.std().item(),
-        "num_samples": Xs.shape[0],
+        "cond_var_mean": per_y_vals.mean().item(),
+        "cond_var_std": per_y_vals.std().item(),
+        "num_Y": len(per_y_vals)
     }
-
 
 
 def binary_stats(X_bin, X_val):
@@ -636,7 +607,7 @@ if __name__ == "__main__":
     stats["invertibility"] = invertibility_stats(model, val_inputs)
     stats["y"] = y_latent_stats(model, val_inputs, val_targets, coarsen_Y)
     stats["z"] = z_free_sanity_stats(Zf)
-    stats["conditional"] = conditional_variation_stats(model, Yl, Zf)
+    stats["conditional"] = conditional_variation_stats(model, Yl)
     stats["bin"] = binary_stats(X_bin_val, val_inputs)
     print("\n=======================================")
     print("Summary statistics over validation set:")
