@@ -62,6 +62,11 @@ class BinaryDecoder:
         thresh = torch.quantile(X, q, dim=1, keepdim=True)
         return (X >= thresh).float()
 
+lambda_x = 8e-5     # range stability, this has been optimized to 8e-4 before further loss options added
+lambda_1   = 5e-4   # sparsity pressure
+lambda_2   = 5e-2   # density accuracy
+alpha = 8.0   # sigmoid sharpness
+
 
 # ============================================================
 #  A loss component to keep X in the correct range
@@ -81,81 +86,36 @@ def sample_z_free_prior(batch_size, z_mean, z_std, scale=1.0):
 # ============================================================
 #  Measures the empirical Z_free distribution
 # ============================================================
-def estimate_z_free_stats(model, X, max_samples=5000):
-    model.eval()
-    Zs = []
-
-    with torch.no_grad():
-        for i in range(min(max_samples, X.shape[0])):
-            Zf, _ = model(X[i:i+1])
-            Zs.append(Zf)
-
-    Zs = torch.cat(Zs, dim=0)
-
-    mean = Zs.mean(dim=0)
-    std = Zs.std(dim=0)
-
-    return mean, std
-
-
-# ============================================================
-#  Various tests to run on the network
-# ============================================================
 @torch.no_grad()
-def test_conditional_variation(model, Y_fixed, n=8):
-    model.eval()
+def z_free_sanity_stats(Zf: torch.Tensor):
+    """
+    Computes statistics-of-statistics for Z_free.
 
-    Zf = torch.randn(n, model.z_free_dim, device=Y_fixed.device)
-    Y = Y_fixed.expand(n, -1)
+    Returns:
+        dict with:
+          - mean_of_means
+          - std_of_means
+          - mean_of_stds
+          - std_of_stds
+    """
 
-    X = model.inverse(Zf, Y)
+    # Flatten per sample (N, D)
+    Zf_flat = Zf.view(Zf.shape[0], -1)
 
-    diffs = (X[1:] - X[:-1]).abs().mean(dim=(1,2,3))
-    print("Mean X diffs under Z_free variation:", diffs.tolist())
+    # Per-sample statistics
+    per_sample_mean = Zf_flat.mean(dim=1)          # (N,)
+    per_sample_std  = Zf_flat.std(dim=1, unbiased=False)  # (N,)
 
+    # Dataset-level aggregation
+    stats = {
+        "Z_free mean (mean)": per_sample_mean.mean().item(),
+        "Z_free mean (std)":  per_sample_mean.std(unbiased=False).item(),
+        "Z_free std (mean)":  per_sample_std.mean().item(),
+        "Z_free std (std)":   per_sample_std.std(unbiased=False).item(),
+    }
 
-@torch.no_grad()
-def test_random_Y_generation(model, n=4):
-    model.eval()
+    return stats
 
-    Zf = torch.randn(n, model.z_free_dim, device=next(model.parameters()).device)
-    Yl = torch.randn(n, model.y_dim, device=Zf.device)
-
-    X_gen = model.inverse(Zf, Yl)
-    Zf2, Yl2 = model(X_gen)
-
-    print("Generated X range:", X_gen.min().item(), X_gen.max().item())
-    print("Z_free diff:", (Zf - Zf2).abs().mean().item())
-    print("Y_latent diff:", (Yl - Yl2).abs().mean().item())
-
-@torch.no_grad()
-def test_latent_consistency(model, X):
-    model.eval()
-
-    Zf1, Yl1 = model(X)
-    X_rec = model.inverse(Zf1, Yl1)
-    Zf2, Yl2 = model(X_rec)
-
-    z_err = (Zf1 - Zf2).abs().mean().item()
-    y_err = (Yl1 - Yl2).abs().mean().item()
-
-    print(f"[Z_free round-trip error] {z_err:.3e}")
-    print(f"[Y_latent round-trip error] {y_err:.3e}")
-
-@torch.no_grad()
-def validate_invertibility(model, x):
-    model.eval()
-    Zf, Yl = model(x)
-
-    X_rec = model.inverse(Zf, Yl)
-
-    max_err = (x - X_rec).abs().max().item()
-    mean_err = (x - X_rec).abs().mean().item()
-
-    print(f"[X→Z→X] max error : {max_err:.3e}")
-    print(f"[X→Z→X] mean error: {mean_err:.3e}")
-
-    return max_err
 
 # ============================================================
 #  This function validates certain properties after an epoch 
@@ -182,6 +142,11 @@ def validate_epoch(
     # ---- Loss ----
     Y_target_coarse = coarsen_Y(Y_val, y_coarse_dim=128)
     val_loss = loss_fn(Y_latent, Y_target_coarse, ep, epochs).item()
+    # Sample Z_free (important: do NOT reuse the same Z_free)
+    Z_free_sampled = torch.randn_like(Z_free)
+    # Inverse pass
+    X_gen = model.inverse(Z_free_sampled, Y_latent)
+    loss_other = loss_function_x(X_gen, X_val)
     print("Target coarse mean:", Y_target_coarse.mean().item())
     # ---- F1 ----
     y_true = Y_target_coarse.cpu().numpy().astype(int)
@@ -213,6 +178,7 @@ def validate_epoch(
 
     return {
         "val_loss": val_loss,
+        "loss_other": loss_other,
         "f1": f1,
         "z_mean": z_mean,
         "z_std": z_std,
@@ -255,7 +221,7 @@ def coarsen_Y(Y, y_coarse_dim=128):
     return Yg.max(dim=2).values
 
 # ============================================================
-#  loss function
+#  loss functions
 # ============================================================
 def distance_aware_bce_loss(logits, targets, epoch, max_epochs, logit_reg_weight=1e-3):
     """
@@ -303,7 +269,19 @@ def distance_aware_bce_loss(logits, targets, epoch, max_epochs, logit_reg_weight
 
     return weighted_bce + logit_reg_weight * logit_reg
 
-
+def loss_function_x(X_gen, X_val):
+    # X-range penalty
+    loss_x = lambda_x * x_range_penalty(X_gen)
+    # x sparsity
+    loss_sparse = lambda_1 * X_gen.abs().mean()
+    # conditional density matching
+    X_prob = torch.sigmoid(alpha * X_gen)
+    true_density = X_val.mean(dim=(1,2,3))
+    gen_density  = X_prob.mean(dim=(1,2,3))
+    loss_density = lambda_2 * ((gen_density - true_density) ** 2).mean()
+    # Total other loss
+    loss_other = (loss_x + loss_sparse + loss_density)
+    return loss_other
 
 # ============================================================
 #  REVERSIBLE COUPLING BLOCK
@@ -436,32 +414,15 @@ def train(model, X, Y, Xv, Yv, epochs=5, batch_size=32, lr=1e-3):
 
             # Inverse pass
             X_gen = model.inverse(Z_free_sampled, Y_latent)
-            lambda_x = 8e-5     # range stability, this has been optimized to 8e-4 before further loss options added
-            lambda_1   = 5e-4   # sparsity pressure
-            lambda_2   = 5e-2   # density accuracy
-            alpha = 8.0   # sigmoid sharpness
-            # X-range penalty
-            loss_x = lambda_x * x_range_penalty(X_gen)
-            # x sparsity
-            loss_sparse = lambda_1 * X_gen.abs().mean()
-            # conditional density matching
-            X_prob = torch.sigmoid(alpha * X_gen)
-            true_density = xb.mean(dim=(1,2,3))
-            gen_density  = X_gen.mean(dim=(1,2,3))
-            loss_density = lambda_2 * ((gen_density - true_density) ** 2).mean()
             # Total loss
             x_weight = min(1.0, ep / 10)
-            loss = loss_y + x_weight * (loss_x + loss_sparse + loss_density)
-
-
-            #this is old z_reg = 1e-4 * (Z_free ** 2).mean()
-            #loss = loss + z_reg
-            #assert Zb.shape == yb.shape, "Z and Y must have same shape"
+            loss = loss_y + x_weight * loss_function_x(X_gen,xb)
 
             loss.backward()
             opt.step()
             losses.append(loss.item())
 
+        print("Loss train y ", loss_y," loss train other: ",(loss_function_x(X_gen,xb)))
         model.eval()
         metrics = validate_epoch(
             model,
@@ -474,7 +435,8 @@ def train(model, X, Y, Xv, Yv, epochs=5, batch_size=32, lr=1e-3):
         )
 
         print(
-           f"VAL | loss={metrics['val_loss']:.4f} "
+           f"VAL | loss Y={metrics['val_loss']:.4f} "
+           f"loss other={metrics['loss_other']:.4f} "
            f"F1={metrics['f1']:.4f} "
            f"Z(mean={metrics['z_mean']:.2f}, std={metrics['z_std']:.2f}) "
            f"inv_err={metrics['inv_error']:.2e}"
@@ -531,44 +493,29 @@ def z_free_stats(model, X_val):
 
 
 @torch.no_grad()
-def conditional_variation_stats(model, Y_latent_all, n_z=6, max_samples=None):
+def conditional_variation_stats(model, Y_latent, n_z=8):
+    device = Y_latent.device
     model.eval()
 
-    device = Y_latent_all.device
-    N = Y_latent_all.shape[0]
+    per_y_vals = []
 
-    if max_samples is not None:
-        N = min(N, max_samples)
+    for i in range(Y_latent.shape[0]):
+        Y_fixed = Y_latent[i:i+1].expand(n_z, -1)  # [n_z, y_dim]
+        Z = torch.randn(n_z, model.z_free_dim, device=device)
 
-    per_y_means = []
-    per_y_stds = []
+        X = model.inverse(Z, Y_fixed)              # [n_z, C, H, W]
+        X_mean = X.mean(dim=0, keepdim=True)
 
-    for i in range(N):
-        Y_fixed = Y_latent_all[i:i+1]              # [1, y_dim]
-        Y_rep = Y_fixed.expand(n_z, -1)            # [n_z, y_dim]
+        dev = (X - X_mean).flatten(start_dim=1).norm(dim=1).mean()
+        per_y_vals.append(dev)
 
-        Zf = torch.randn(n_z, model.z_free_dim, device=device)
+    per_y_vals = torch.stack(per_y_vals)
 
-        X = model.inverse(Zf, Y_rep)               # [n_z, C, H, W]
-
-        # pairwise consecutive diffs
-        diffs = (X[1:] - X[:-1]).abs().mean(dim=(1,2,3))
-
-        per_y_means.append(diffs.mean())
-        per_y_stds.append(diffs.std())
-
-    per_y_means = torch.stack(per_y_means)
-    per_y_stds = torch.stack(per_y_stds)
-
-    stats = {
-        "mean_of_means": per_y_means.mean().item(),
-        "std_of_means":  per_y_means.std().item(),
-        "min_mean":      per_y_means.min().item(),
-        "max_mean":      per_y_means.max().item(),
-        "mean_of_stds":  per_y_stds.mean().item(),
+    return {
+        "cond_var_mean": per_y_vals.mean().item(),
+        "cond_var_std": per_y_vals.std().item(),
+        "num_Y": len(per_y_vals)
     }
-
-    return stats
 
 
 def binary_stats(X_bin, X_val):
@@ -630,6 +577,8 @@ if __name__ == "__main__":
     targets = torch.tensor(Ynew, dtype=torch.float32).to(device)
     inputs = torch.tensor(Xnew, dtype=torch.float32).to(device)
     print("Estimated entropy of input:",estimate_entropy(inputs))
+    row_sums = torch.sum(targets)
+    print(row_sums,"_____",targets.shape)
 
     val_split=0.2
     targets = targets.float()
@@ -657,16 +606,26 @@ if __name__ == "__main__":
     stats = {}
     stats["invertibility"] = invertibility_stats(model, val_inputs)
     stats["y"] = y_latent_stats(model, val_inputs, val_targets, coarsen_Y)
-    stats["z"] = z_free_stats(model, val_inputs)
+    stats["z"] = z_free_sanity_stats(Zf)
     stats["conditional"] = conditional_variation_stats(model, Yl)
     stats["bin"] = binary_stats(X_bin_val, val_inputs)
     print("\n=======================================")
     print("Summary statistics over validation set:")
     print(stats)
 
+    slice_tensor = val_inputs[:, 3, :, :]
+    result_tensor = pd.DataFrame(torch.sum(slice_tensor, dim=(1, 2)).cpu())
+    slice_tensor2 = X_bin_val[:, 3, :, :]
+    result_tensor2 = pd.DataFrame(torch.sum(slice_tensor2, dim=(1, 2)).cpu())
+    print("size correlation of reverse validation set:",result_tensor.corrwith(result_tensor2, axis=0).array[0].item())
 
-
-
+    #torch.set_printoptions(profile="full")
+    #for y, yp, id in zip(val_targets,Yl,val_idx):
+    #    yb=coarsen_Y(y[None,:], y_coarse_dim=128)[0]
+    #    ypb=(torch.sigmoid(yp) > 0.5).int()
+    #    yb=torch.nonzero(yb)
+    #    ypb=torch.nonzero(ypb)
+    #    print(df["A"].values[id],yb,ypb,"\n")
 
 
 
